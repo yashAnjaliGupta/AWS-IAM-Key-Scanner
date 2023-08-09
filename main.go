@@ -13,18 +13,21 @@ import (
 	"regexp"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 type validAWSKeysinfo struct {
 	FileName   string
 	CommitHash string
+	Branch     string
 	Author     string
 	Message    string
 	AccessKey  string
@@ -39,111 +42,123 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get the HEAD reference
-	ref, err := r.Head()
-	if err != nil {
-		fmt.Printf("Error getting HEAD reference: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Regex to match AWS IAM keys
 	accessKeyRegex := regexp.MustCompile(`(^|[^A-Za-z0-9/+=])[A-Za-z0-9/+=]{20}([^A-Za-z0-9/+=]|$)`)
 	secretKeyRegex := regexp.MustCompile(`(^|[^A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}([^A-Za-z0-9/+=]|$)`)
 
 	var validAWSKeys []validAWSKeysinfo
-	// Get the commit object of the latest commit
-	commit, err := r.CommitObject(ref.Hash())
+	// Iterate through all branches in the repository
+	branches, err := r.Branches()
 	if err != nil {
-		fmt.Printf("Error getting commit object: %v\n", err)
+		fmt.Printf("Error getting branches: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Get the tree of the commit to scan the lastest Commit for AWS IAM keys
-	tree, err := commit.Tree()
-	tree.Files().ForEach(func(file *object.File) error {
-		contents, err := file.Contents()
+	err = branches.ForEach(func(ref *plumbing.Reference) error {
+		// fmt.Printf("Scanning branch %s\n", ref.Name().Short())
+		// Get the commit object of the latest commit on the branch
+		commit, err := r.CommitObject(ref.Hash())
 		if err != nil {
-			fmt.Printf("Error reading file contents: %v\n", err)
-			os.Exit(1)
+			return err
 		}
-		// Search the file contents for AWS IAM keys
-		accessKeys := accessKeyRegex.FindAllString(string(contents), -1)
-		secretKeys := secretKeyRegex.FindAllString(string(contents), -1)
+		// Get the tree of the commit to scan for AWS IAM keys
+		tree, err := commit.Tree()
+		if err != nil {
+			return err
+		}
+		tree.Files().ForEach(func(file *object.File) error {
+			contents, err := file.Contents()
+			if err != nil {
+				return err
+			}
+			// Search the file contents for AWS IAM keys
+			accessKeys := accessKeyRegex.FindAllString(string(contents), -1)
+			secretKeys := secretKeyRegex.FindAllString(string(contents), -1)
 
-		for _, accessKey := range accessKeys {
-			for _, secretKey := range secretKeys {
-				accessKey = stripNewlines(accessKey)
-				secretKey = stripNewlines(secretKey)
-				// Test the IAM keys
-				if testIAMKeys(accessKey, secretKey) {
-					gc := validAWSKeysinfo{
-						FileName:   file.Name,
-						CommitHash: commit.Hash.String(),
-						Author:     fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email),
-						Message:    commit.Message,
-						AccessKey:  accessKey,
-						SecretKey:  secretKey,
+			for _, accessKey := range accessKeys {
+				for _, secretKey := range secretKeys {
+					accessKey = stripNewlines(accessKey)
+					secretKey = stripNewlines(secretKey)
+					// Test the IAM keys
+					if validateIAMKeyWithAPI(accessKey, secretKey) {
+						gc := validAWSKeysinfo{
+							FileName:   file.Name,
+							CommitHash: commit.Hash.String(),
+							Branch:     ref.Name().Short(),
+							Author:     fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email),
+							Message:    commit.Message,
+							AccessKey:  accessKey,
+							SecretKey:  secretKey,
+						}
+						validAWSKeys = append(validAWSKeys, gc)
 					}
-					validAWSKeys = append(validAWSKeys, gc)
 				}
 			}
-		}
-		return nil
-	})
-	// Iterate through the commit history
-	commits := make([]*object.Commit, 0)
-	for commit != nil {
-		commits = append(commits, commit)
-		parents := commit.Parents()
-		if parents == nil {
-			break
-		}
-		commit = nil
-		parents.ForEach(func(parent *object.Commit) error {
-			commit = parent
 			return nil
 		})
-	}
 
-	// Iterate through the commits in reverse order
-	for i := len(commits) - 1; i >= 0; i-- {
-		commit := commits[i]
-		tree, err := getCommitDifferences(r, commit)
+		// Iterate through the commit history
+		commits := make([]*object.Commit, 0)
+		iter, err := r.Log(&git.LogOptions{})
 		if err != nil {
-			fmt.Printf("Error getting patch: %v\n", err)
-			continue
+			fmt.Printf("Error getting commit history: %v\n", err)
+			os.Exit(1)
 		}
-		// Search the patch for AWS IAM keys
-		patch, err := tree.Patch()
-		for _, filePatch := range patch.FilePatches() {
-			_, toFile := filePatch.Files()
-			for _, chunk := range filePatch.Chunks() {
+		err = iter.ForEach(func(commit *object.Commit) error {
+			commits = append(commits, commit)
+			return nil
+		})
+		if err != nil {
+			fmt.Printf("Error iterating through commit history: %v\n", err)
+			os.Exit(1)
+		}
 
-				accessKeys := accessKeyRegex.FindAllString(string(chunk.Content()), -1)
-				secretKeys := secretKeyRegex.FindAllString(string(chunk.Content()), -1)
+		// Iterate through the commits in reverse order
+		for i := len(commits) - 1; i >= 0; i-- {
+			commit := commits[i]
+			tree, err := getCommitDifferences(r, commit)
+			if err != nil {
+				fmt.Printf("Error getting patch: %v\n", err)
+				continue
+			}
+			// Search the patch for AWS IAM keys
+			patch, err := tree.Patch()
+			for _, filePatch := range patch.FilePatches() {
+				_, toFile := filePatch.Files()
+				for _, chunk := range filePatch.Chunks() {
 
-				for _, accessKey := range accessKeys {
-					for _, secretKey := range secretKeys {
+					accessKeys := accessKeyRegex.FindAllString(string(chunk.Content()), -1)
+					secretKeys := secretKeyRegex.FindAllString(string(chunk.Content()), -1)
 
-						accessKey = stripNewlines(accessKey)
-						secretKey = stripNewlines(secretKey)
+					for _, accessKey := range accessKeys {
+						for _, secretKey := range secretKeys {
 
-						if testIAMKeys(accessKey, secretKey) {
-							gc := validAWSKeysinfo{
-								FileName:   toFile.Path(),
-								CommitHash: commit.Hash.String(),
-								Author:     fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email),
-								Message:    commit.Message,
-								AccessKey:  accessKey,
-								SecretKey:  secretKey,
+							accessKey = stripNewlines(accessKey)
+							secretKey = stripNewlines(secretKey)
+
+							if validateIAMKeyWithAPI(accessKey, secretKey) {
+								gc := validAWSKeysinfo{
+									FileName:   toFile.Path(),
+									CommitHash: commit.Hash.String(),
+									Branch:     ref.Name().Short(),
+									Author:     fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email),
+									Message:    commit.Message,
+									AccessKey:  accessKey,
+									SecretKey:  secretKey,
+								}
+								validAWSKeys = append(validAWSKeys, gc)
 							}
-							validAWSKeys = append(validAWSKeys, gc)
 						}
 					}
 				}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		fmt.Printf("Error iterating through branches: %v\n", err)
+		os.Exit(1)
 	}
+
 	// Create a map to keep track of unique validAWSKeysinfo values
 	uniqueCommits := make(map[validAWSKeysinfo]struct{})
 
@@ -167,6 +182,7 @@ func main() {
 
 func printvalidAWSKeysinfo(commits []validAWSKeysinfo) {
 	for _, commit := range commits {
+		fmt.Printf("Branch: %s\n", commit.Branch)
 		fmt.Printf("File: %s\n", commit.FileName)
 		fmt.Printf("Commit Hash: %s\n", commit.CommitHash)
 		fmt.Printf("Author: %s\n", commit.Author)
@@ -200,6 +216,37 @@ func getCommitDifferences(r *git.Repository, commit *object.Commit) (object.Chan
 	}
 	Changes, err := parentTree.Diff(commitTree)
 	return Changes, err
+}
+
+func validateIAMKeyWithAPI(accessKey, secretKey string) bool {
+	// Create a new AWS session with the provided access key and secret key
+	sess, err := session.NewSession(&aws.Config{
+		Region:      aws.String("us-west-2"),
+		Credentials: credentials.NewStaticCredentials(accessKey, secretKey, ""),
+	})
+	if err != nil {
+		fmt.Printf("Error creating AWS session: %v\n", err)
+		return false
+	}
+
+	// Create a new IAM client with the session
+	svc := iam.New(sess)
+
+	// Call the ListUsers API to check if the IAM key is valid
+	_, err = svc.GetUser(&iam.GetUserInput{})
+	if err != nil {
+		// fmt.Println("Error in calling ListUsers API:", err)
+		if aerr, ok := err.(awserr.Error); ok {
+			// Check if the error code is "AccessDenied" (403 status code)
+			if aerr.Code() == "AccessDenied" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// If the API call succeeds, the IAM key is valid
+	return true
 }
 
 // funtion to test IAM keys
